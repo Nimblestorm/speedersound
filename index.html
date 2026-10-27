@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#15171a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Speeder">
+<title>Speeder</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <header id="status" aria-live="polite"></header>
+  <main>
+    <div id="speed" role="button" aria-label="Speed, tap to change units">0</div>
+    <div id="units">mph</div>
+    <div class="bar"><div id="fill"></div></div>
+  </main>
+  <footer>
+    <button id="power" class="big">ON</button>
+    <button id="calibrate" class="big secondary">CALIBRATE</button>
+  </footer>
+  <button id="help" aria-label="Setup and diagnostics">?</button>
+  <div id="version"></div>
+  <div id="update" hidden>Update ready, tap to reload</div>
+</div>
+
+<section id="setup" class="overlay" hidden>
+  <h2>Speeder setup</h2>
+  <ol>
+    <li>Share, then <b>Add to Home Screen</b>, then open it from there.</li>
+    <li>Make sure the phone is <b>not on Silent</b> (ring switch or Action button).</li>
+    <li>Allow <b>Location</b> while using, with Precise on.</li>
+    <li>Allow <b>Motion</b> when asked. Set <b>Auto-Lock to Never</b> while riding.</li>
+  </ol>
+  <p class="note">While the engine is on, other apps' audio pauses, like a music app.</p>
+  <p class="note">Problems? Tap <b>?</b>, then <b>Copy report</b>, and send it to Kiousu.</p>
+  <button id="gotit" class="big">Got it</button>
+  <button id="showdiag" class="big secondary">Diagnostics</button>
+</section>
+
+<section id="diag" class="overlay" hidden>
+  <h2>Diagnostics</h2>
+  <pre id="report"></pre>
+  <button id="copyreport" class="big">Copy report</button>
+  <button id="closediag" class="big secondary">Close</button>
+</section>
+
+<section id="calib" class="overlay center" hidden>
+  <h2 id="calibTitle"></h2>
+  <p id="calibText" class="calib-text"></p>
+  <button id="calibNext" class="big">Done</button>
+  <button id="calibCancel" class="big secondary">Cancel</button>
+</section>
+
+<audio id="silence" hidden></audio>
+<script type="module" src="app.js"></script>
+</body>
+</html>
