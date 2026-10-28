@@ -68,9 +68,13 @@ export class SpeedModel {
     this.cfg = cfg;
     this.topSpeed = cfg.topSpeedMps;
     this.speedEstimate = 0;
-    this.forwardAccel = 0;
+    this.lpf = 0;               // low-passed raw forward acceleration
+    this.restBias = 0;          // forward-axis offset learned while GPS says stopped
+    this.forwardAccel = 0;      // lpf - restBias: what everything downstream uses
+    this.stoppedFresh = false;  // a fresh fix says stopped and so does the model; decided by update()
     this.lastGpsT = -Infinity;
     this.lastGps = null;
+    this.gpsTarget = null;
     this.lastUpdateT = null;
   }
 
@@ -78,20 +82,33 @@ export class SpeedModel {
     if (Number.isFinite(mps) && mps > 0) this.topSpeed = mps;
   }
 
+  resetBias() { this.restBias = 0; }
+
   updateMotion(forwardAccelRaw, dt) {
     if (!Number.isFinite(forwardAccelRaw) || !(dt > 0)) return;
-    const alpha = dt / (this.cfg.accelLpfTau + dt);
-    this.forwardAccel += alpha * (forwardAccelRaw - this.forwardAccel);
+    const c = this.cfg;
+    const alpha = dt / (c.accelLpfTau + dt);
+    this.lpf += alpha * (forwardAccelRaw - this.lpf);
+    // A tilted phone reads a constant offset at rest. Track it slowly while a
+    // FRESH fix says stopped (never "no GPS yet" or a decayed dropout) and the
+    // reading is near the current bias (so a real gentle push is not
+    // swallowed), and never beyond restBiasMax.
+    if (this.stoppedFresh && Math.abs(this.lpf - this.restBias) < c.restBiasWindow) {
+      const beta = dt / (c.restBiasTau + dt);
+      this.restBias = clamp(this.restBias + beta * (this.lpf - this.restBias), -c.restBiasMax, c.restBiasMax);
+    }
+    this.forwardAccel = this.lpf - this.restBias;
     this.speedEstimate = clamp(this.speedEstimate + this.forwardAccel * dt, 0, 1.3 * this.topSpeed);
   }
 
   updateGps(speedMps, t) {
     if (speedMps == null || !Number.isFinite(speedMps) || speedMps < 0) return;
     // The very first fix is the only information we have: take it whole.
-    const blend = this.lastGpsT === -Infinity ? 1 : this.cfg.gpsBlend;
+    // Later fixes only set the target that update() pulls toward.
+    if (this.lastGpsT === -Infinity) this.speedEstimate = speedMps;
     this.lastGpsT = t;
     this.lastGps = speedMps;
-    this.speedEstimate += blend * (speedMps - this.speedEstimate);
+    this.gpsTarget = speedMps;
   }
 
   /** The last GPS speed, held for gpsHoldS and then decayed linearly to 0 over gpsDecayS. */
@@ -107,17 +124,32 @@ export class SpeedModel {
     const gpsAge = t - this.lastGpsT;
     const dt = this.lastUpdateT == null ? 0 : Math.max(0, t - this.lastUpdateT);
     this.lastUpdateT = t;
-    if (gpsAge > this.cfg.gpsHoldS) {
+    const c = this.cfg;
+    this.stoppedFresh = this.lastGps != null && gpsAge <= c.gpsHoldS
+      && this.lastGps < c.standstillMps && this.speedEstimate < c.standstillMps;
+    if (gpsAge <= c.gpsFreshS) {
+      // Pull toward a FRESH fix with a first-order lag, so a fix never steps
+      // the pitch. While pushing hard, GPS (which lags a launch by a second
+      // or two) may only raise the estimate, never drag it down.
+      const pushing = this.forwardAccel > c.launchPushMps2 && this.gpsTarget < this.speedEstimate;
+      if (this.gpsTarget != null && dt > 0 && !pushing) {
+        this.speedEstimate += (this.gpsTarget - this.speedEstimate) * (1 - Math.exp(-dt / c.gpsPullTau));
+      }
+    } else if (gpsAge <= c.gpsHoldS) {
+      // Stale but within the hold: coast on the accelerometer rather than
+      // sag toward a fix from before the launch (iOS reports null speed for
+      // seconds at a time).
+    } else {
       // Linear ramp to zero that lands at gpsHoldS + gpsDecayS.
-      const remaining = this.cfg.gpsHoldS + this.cfg.gpsDecayS - gpsAge;
+      const remaining = c.gpsHoldS + c.gpsDecayS - gpsAge;
       if (remaining <= 0) this.speedEstimate = 0;
       else if (dt > 0) this.speedEstimate *= Math.max(0, remaining / (remaining + dt));
     }
     const speed = this.speedEstimate;
-    let throttle = clamp(speed / this.topSpeed, 0, 1);
-    throttle += this.cfg.accelBias * clamp(this.forwardAccel / 2, 0, 1);
-    throttle = clamp(throttle, 0, 1);
-    return { speed, throttle, forwardAccel: this.forwardAccel, gpsAge };
+    const speedRatio = clamp(speed / this.topSpeed, 0, 1);
+    const push = clamp(this.forwardAccel / 2, 0, 1);
+    const throttle = clamp(speedRatio + c.accelBias * push, 0, 1);
+    return { speed, throttle, forwardAccel: this.forwardAccel, gpsAge, speedRatio, push };
   }
 }
 
@@ -134,17 +166,28 @@ export class EventDetector {
     this.brakeStart = null;
     this.lastAccelFire = -Infinity;
     this.lastBrakeFire = -Infinity;
+    this.boostArmed = true;
+    this.boostPushStart = null;
+    this.lastBoostFire = -Infinity;
   }
 
-  update(forwardAccel, gpsSpeedMps, t) {
+  /**
+   * @returns {{type:'launch'|'accel', strength:number}|{type:'brake'}|{type:'boost'}|null}
+   * One event per call; launch/accel first, then brake, then boost.
+   */
+  update(forwardAccel, gpsSpeedMps, t, speedRatio = 0) {
     const c = this.cfg;
-    const standstill = !(gpsSpeedMps >= c.standstillMps);
+    const standstillNow = !(gpsSpeedMps >= c.standstillMps);
+    // An acceleration window keeps the classification it opened with: a
+    // pull-away is a launch even though the speed estimate (which the push
+    // itself raises) passes 1 m/s before the 0.5 s hold is over.
+    const standstill = this.accelStart == null ? standstillNow : this.accelStandstill;
     const threshold = standstill ? c.standstillThreshold : c.accelThreshold;
     const hold = standstill ? c.standstillHoldS : c.accelHoldS;
 
-    // Acceleration window
+    // Acceleration window: a launch when pulling away from a stop, a whoosh when rolling.
     if (forwardAccel > threshold) {
-      if (this.accelStart == null) { this.accelStart = t; this.accelPeak = forwardAccel; }
+      if (this.accelStart == null) { this.accelStart = t; this.accelPeak = forwardAccel; this.accelStandstill = standstillNow; }
       this.accelPeak = Math.max(this.accelPeak, forwardAccel);
       if (t - this.accelStart >= hold && t - this.lastAccelFire >= c.accelCooldownS) {
         this.lastAccelFire = t;
@@ -152,11 +195,18 @@ export class EventDetector {
         // standstill launch is not quieter than the same push while rolling.
         const strength = clamp((this.accelPeak - c.accelThreshold) / 2, 0.3, 1);
         this.accelStart = null;
-        return { type: 'accel', strength };
+        return { type: standstill ? 'launch' : 'accel', strength };
       }
     } else {
       this.accelStart = null;
     }
+
+    // Boost: plain speed ratio crosses boostRatio upward with sustained push.
+    if (forwardAccel > c.boostPushMps2) { if (this.boostPushStart == null) this.boostPushStart = t; }
+    else this.boostPushStart = null;
+    if (speedRatio < c.boostRearmRatio) this.boostArmed = true;
+    const pushHeld = this.boostPushStart != null && t - this.boostPushStart >= c.boostHoldS;
+    const boostDue = this.boostArmed && speedRatio >= c.boostRatio && pushHeld && t - this.lastBoostFire >= c.boostCooldownS;
 
     // Brake window
     if (!standstill && forwardAccel < c.brakeThreshold) {
@@ -168,6 +218,12 @@ export class EventDetector {
       }
     } else {
       this.brakeStart = null;
+    }
+
+    if (boostDue) {
+      this.boostArmed = false;
+      this.lastBoostFire = t;
+      return { type: 'boost' };
     }
     return null;
   }

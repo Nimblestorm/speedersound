@@ -17,9 +17,10 @@ export class Controller {
     sensors, engine, store, now, wake = noWake,
     unlockAudio = async () => '', resumeAudio = async () => {}, restartSilent = async () => {},
     audioState = () => 'n/a', audioSessionType = () => 'n/a', silentState = () => 'n/a',
-    userAgent = '', cfg = DEFAULTS, calib = null,
+    userAgent = '', cfg = DEFAULTS, calib = null, standalone = null,
   }) {
     this.sensors = sensors;
+    this.standalone = standalone;      // true from the Home Screen icon, false in a browser tab, null unknown
     this.engine = engine;
     this.store = store;
     this.now = now;
@@ -45,8 +46,10 @@ export class Controller {
     this.units = store.loadJSON(STORAGE.units, 'mph');
 
     this.running = false;
+    this.session = 0;             // bumped by on() and off(); an on() whose session ended mid-await backs out
     this.stopGps = null;
     this.stopMotion = null;
+    this.lastInterval = null;     // seconds, as normalised from the last motion sample
     this.motionStartT = null;
     this.motionSamples = 0;
     this.events = [];
@@ -69,6 +72,7 @@ export class Controller {
   async on() {
     if (this.running) return;
     this.running = true;
+    const session = ++this.session;
     this.status.audioError = '';
     const pUnlock = startNow(() => this.unlockAudio());      // sets session type, calls play()
     const pResume = startNow(() => this.resumeAudio());
@@ -76,6 +80,7 @@ export class Controller {
     const pWake = startNow(() => this.wake.acquire());       // calls wakeLock.request() / video.play()
     const pGps = startNow(() => this.startGpsWatch());
     const [unlock, resume, , wake, gps] = await Promise.allSettled([pUnlock, pResume, pMotion, pWake, pGps]);
+    if (session !== this.session) { await this.backOut(); return; }   // OFF tapped while we waited
 
     const unlockErr = unlock.status === 'fulfilled' ? unlock.value : errMsg(unlock.reason);
     if (unlockErr) { this.status.audioError = unlockErr; this.status.silentSuspected = isIOS(this.userAgent); }
@@ -85,6 +90,7 @@ export class Controller {
 
     try {
       if (!this.engine.loaded) await this.engine.load();
+      if (session !== this.session) { await this.backOut(); return; }
       this.engine.start();
       this.engine.setThrottle(this.model.update(this.now()).throttle);
     } catch (e) {
@@ -92,14 +98,26 @@ export class Controller {
     }
   }
 
-  async off() {
-    if (!this.running) return;
-    this.running = false;
-    await this.engine.stop();
+  /** An on() that lost its session: release whatever its awaits acquired after off() ran. */
+  async backOut() {
+    if (this.running) return;
     if (this.stopGps) { this.stopGps(); this.stopGps = null; }
     if (!this.calibration) this.releaseMotion();
     await this.wake.release();
-    this.status.wakeMode = this.wake.mode ?? 'none';
+    this.status.wakeMode = 'none';
+  }
+
+  async off() {
+    if (!this.running) return;
+    this.running = false;
+    this.session += 1;
+    // Release everything BEFORE awaiting the shutdown fade, so an ON tap
+    // during the fade re-acquires cleanly instead of being released afterwards.
+    if (this.stopGps) { this.stopGps(); this.stopGps = null; }
+    if (!this.calibration) this.releaseMotion();
+    const pRelease = this.wake.release();
+    this.status.wakeMode = 'none';
+    await Promise.allSettled([this.engine.stop(), pRelease]);
   }
 
   /** Page shown again (after a call, app switch, notification). */
@@ -140,6 +158,7 @@ export class Controller {
 
   async ensureMotion() {
     if (this.stopMotion) return this.status.motion !== 'no permission' && this.status.motion !== 'unavailable';
+    const session = this.session;
     let perm;
     try {
       perm = await this.sensors.requestMotionPermission();
@@ -147,6 +166,7 @@ export class Controller {
       perm = 'denied';
       this.status.motionError = errMsg(e);
     }
+    if (session !== this.session && !this.calibration) return false;   // OFF arrived while the prompt was open
     if (perm !== 'granted') {
       this.status.motion = perm === 'denied' ? 'no permission' : 'unavailable';
       return false;
@@ -177,6 +197,7 @@ export class Controller {
 
   onMotion(s) {
     this.motionSamples += 1;
+    this.lastInterval = s.interval;
     if (this.status.motion === 'waiting') this.status.motion = 'ok';
     if (this.calibration) {
       if (this.calibration.step === 'still') this.calibration.gravity.push(s.accelG);
@@ -197,11 +218,16 @@ export class Controller {
     }
     this.status.sound = this.soundStatus();
     if (!this.running) return r;
-    this.engine.setThrottle(r.throttle);
+    this.engine.setThrottle(r.throttle, r.push);
     if (this.calib && this.status.motion === 'ok' && !this.calibration) {
-      const ev = this.detector.update(r.forwardAccel, this.model.gpsSpeedHeld(t), t);
+      // "Stopped" needs both GPS and the model to agree: GPS lags a launch, so
+      // the push-wins estimate is what ends the standstill (one launch, then howls).
+      const stoppedSpeed = Math.max(this.model.gpsSpeedHeld(t), r.speed);
+      const ev = this.detector.update(r.forwardAccel, stoppedSpeed, t, r.speedRatio);
       if (ev) {
         if (ev.type === 'accel') this.engine.playWhoosh(ev.strength);
+        else if (ev.type === 'launch') this.engine.playLaunch();
+        else if (ev.type === 'boost') this.engine.playBoost();
         else this.engine.playBrake();
         this.events.push({ t, ...ev });
         if (this.events.length > 10) this.events.shift();
@@ -215,7 +241,8 @@ export class Controller {
     if (!this.running) return this.engine.loaded ? 'off' : 'loading';
     const st = this.audioState();
     if (st === 'running') return this.engine.state === 'running' ? 'ok' : 'starting';
-    return st === 'n/a' ? 'ok' : st;     // 'suspended' | 'interrupted' | 'closed'
+    if (st === 'interrupted') return 'interrupted, tap to resume';   // iOS: another app or a call took the session
+    return st === 'n/a' ? 'ok' : st;     // 'suspended' | 'closed'
   }
 
   // ---- calibration -----------------------------------------------------
@@ -250,14 +277,20 @@ export class Controller {
   async finishCalibration(calib) {
     this.calib = calib;
     this.store.saveJSON(STORAGE.calib, calib);
-    this.learner.reset();
-    this.store.remove(STORAGE.learnedMax);
-    this.rideFloor = this.learner.topSpeed;
-    this.model.setTopSpeed(this.rideFloor);
+    this.resetTopSpeed();
+    this.model.resetBias();
     this.detector = new EventDetector(this.cfg);
     this.status.calibrated = true;
     this.calibration = null;
     if (!this.running) this.releaseMotion();
+  }
+
+  /** Forget the learned top speed (a car ride, say) and fall back to the default. */
+  resetTopSpeed() {
+    this.learner.reset();
+    this.store.remove(STORAGE.learnedMax);
+    this.rideFloor = this.learner.topSpeed;
+    this.model.setTopSpeed(this.rideFloor);
   }
 
   // ---- misc ------------------------------------------------------------
@@ -274,9 +307,11 @@ export class Controller {
       userAgent: this.userAgent, version: VERSION,
       status: {
         ...this.status, running: this.running, units: this.units,
+        standalone: this.standalone == null ? 'n/a' : this.standalone,
         audioState: this.audioState(), audioSessionType: this.audioSessionType(), silentElement: this.silentState(),
         engineState: this.engine.state, loadErrors: (this.engine.loadErrors || []).join('; ') || 'none',
         motionSamples: this.motionSamples,
+        motionIntervalMs: this.lastInterval == null ? 'n/a' : +(this.lastInterval * 1000).toFixed(1),
         topSpeedMps: this.model.topSpeed, learnedMaxMps: this.learner.learnedMax,
         gpsSpeedHeldMps: this.model.gpsSpeedHeld(this.now()), speedMps: this.last.speed, forwardAccel: this.last.forwardAccel,
       },
@@ -316,7 +351,7 @@ async function main() {
   engine.load().catch(() => {});                  // decode clips while the page sits idle; on() awaits the same promise
 
   const c = new Controller({
-    sensors, engine, store, now, wake, userAgent: navigator.userAgent,
+    sensors, engine, store, now, wake, userAgent: navigator.userAgent, standalone,
     calib: sim ? sensors.calib : null,
     unlockAudio: sim ? async () => '' : () => sensorsMod.unlockAudioSession(audioEl, { silenceUrl }),
     resumeAudio: () => ctx.resume(),
@@ -335,9 +370,12 @@ async function main() {
     if (c.status.gpsError) { const d = document.createElement('div'); d.className = 'warn'; d.textContent = c.status.gpsError; status.appendChild(d); }
   };
   const renderPower = () => { power.textContent = c.running ? 'OFF' : 'ON'; power.classList.toggle('on', c.running); };
+  // Not disabled during the fades: running flips synchronously, and ON
+  // during the shutdown fade is a supported restart.
   power.onclick = async () => {
-    power.disabled = true;
-    try { if (c.running) await c.off(); else await c.on(); } finally { power.disabled = false; }
+    const p = c.running ? c.off() : c.on();
+    renderPower(); renderStatus();
+    await p;
     renderPower(); renderStatus();
   };
   speed.onclick = () => { c.toggleUnits(); units.textContent = c.units === 'mph' ? 'mph' : 'km/h'; };
@@ -370,7 +408,15 @@ async function main() {
   const showSetup = (show) => { setup.hidden = !show; };
   showSetup(!store.loadJSON(STORAGE.setupDone, false));
   $('gotit').onclick = () => { store.saveJSON(STORAGE.setupDone, true); showSetup(false); };
-  $('help').onclick = () => showSetup(true);
+  $('standaloneNote').hidden = !(isIOS(navigator.userAgent) && !standalone);
+  const unitLabel = () => (c.units === 'mph' ? 'mph' : 'km/h');
+  const renderLearned = () => {
+    const m = c.learner.learnedMax;
+    $('learned').textContent = m > 0 ? `${formatSpeed(m, c.units)} ${unitLabel()}` : 'none';
+  };
+  renderLearned();
+  $('resettop').onclick = () => { c.resetTopSpeed(); renderLearned(); };
+  $('help').onclick = () => { renderLearned(); showSetup(true); };
   $('showdiag').onclick = () => { report.textContent = c.report(); diag.hidden = false; };
   $('closediag').onclick = () => { diag.hidden = true; };
   $('copyreport').onclick = async () => {

@@ -10,7 +10,7 @@
 // stale-while-revalidate within a version, so a config tweak without a
 // version bump still arrives on the next online open; the page asks with
 // 'check-update' once it is listening.
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const CACHE = `speeder-${VERSION}`;
 const PRECACHE = [
   './',
@@ -27,11 +27,20 @@ const PRECACHE = [
   './motion.js',
   './sensors.js',
   './silence.m4a',
-  './sounds/brake-1.m4a',
-  './sounds/brake-2.m4a',
-  './sounds/drone.m4a',
-  './sounds/whoosh-1.m4a',
-  './sounds/whoosh-2.m4a',
+  './sounds/0.2.0/accel.m4a',
+  './sounds/0.2.0/boost-1.m4a',
+  './sounds/0.2.0/boost-2.m4a',
+  './sounds/0.2.0/brake-1.m4a',
+  './sounds/0.2.0/brake-2.m4a',
+  './sounds/0.2.0/drone.m4a',
+  './sounds/0.2.0/launch-1.m4a',
+  './sounds/0.2.0/launch-2.m4a',
+  './sounds/0.2.0/low.m4a',
+  './sounds/0.2.0/shutdown.m4a',
+  './sounds/0.2.0/startup.m4a',
+  './sounds/0.2.0/whoosh-1.m4a',
+  './sounds/0.2.0/whoosh-2.m4a',
+  './sounds/0.2.0/whoosh-3.m4a',
   './store.js',
   './ui.js',
   './wake.mp4',
@@ -40,7 +49,9 @@ const CACHE_FIRST = /\.(m4a|mp4|png|svg)$/;
 let updatePending = false;
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(PRECACHE)));
+  // cache: 'reload' bypasses the HTTP cache (GitHub Pages sends max-age=600),
+  // so a new version's cache can never fill from stale bytes.
+  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(PRECACHE.map((u) => new Request(u, { cache: 'reload' })))));
 });
 
 self.addEventListener('activate', (event) => {

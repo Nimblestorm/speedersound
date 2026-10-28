@@ -11,7 +11,10 @@ export function normalizeMotionEvent(e) {
   const a = e?.acceleration;
   const g = e?.accelerationIncludingGravity;
   if (!finiteVec(a) || !finiteVec(g)) return null;
-  const interval = Number.isFinite(e.interval) && e.interval > 0 ? e.interval / 1000 : 1 / 60;
+  // The spec says milliseconds (Chrome: ~16.7). WebKit has been reported to
+  // give seconds (~0.0167); a value of 1 or less can only be seconds.
+  const raw = e.interval;
+  const interval = Number.isFinite(raw) && raw > 0 ? (raw > 1 ? raw / 1000 : raw) : 1 / 60;
   return {
     accel: { x: a.x, y: a.y, z: a.z },
     accelG: { x: g.x, y: g.y, z: g.z },
@@ -156,12 +159,16 @@ export async function unlockAudioSession(audioEl, { silenceUrl = 'silence.m4a' }
 /**
  * Keyboard-driven stand-in for the sensors (desktop tuning, ?sim=1):
  * ArrowUp/ArrowDown change simulated GPS speed by 1 mph, Space injects a
- * 0.6 s forward burst of 3 m/s², B a 1.0 s burst of -3 m/s².
+ * 0.6 s forward burst of 3 m/s² (a launch from a stop, a whoosh when
+ * rolling), G a 1.5 s push of 1.5 m/s² (boost when past 60% of top speed),
+ * B a 1.0 s burst of -3 m/s² (brake). Simulated GPS lags a burst by one
+ * tick, as real GPS does.
  */
 export class SimSource {
   constructor() {
     this.speed = 0;            // m/s
     this.burst = 0;            // m/s² currently injected
+    this.prevBurst = 0;        // burst seen by the previous GPS tick
     this.burstUntil = 0;
     this.calib = { down: { x: 0, y: 0, z: -1 }, forward: { x: 0, y: 1, z: 0 } };
     this.onKey = (e) => {
@@ -169,6 +176,7 @@ export class SimSource {
       if (e.key === 'ArrowUp') this.speed += mph;
       else if (e.key === 'ArrowDown') this.speed = Math.max(0, this.speed - mph);
       else if (e.key === ' ') { this.burst = 3; this.burstUntil = nowS() + 0.6; }
+      else if (e.key === 'g' || e.key === 'G') { this.burst = 1.5; this.burstUntil = nowS() + 1.5; }
       else if (e.key === 'b' || e.key === 'B') { this.burst = -3; this.burstUntil = nowS() + 1.0; }
       else return;
       e.preventDefault();
@@ -189,8 +197,9 @@ export class SimSource {
 
   startGps(onFix) {
     const tick = () => {
-      // Bursts move the simulated speed so GPS and accel agree.
-      this.speed = Math.max(0, this.speed + this.burst * 0.5);
+      // Bursts move the simulated speed so GPS and accel agree, one tick late.
+      this.speed = Math.max(0, this.speed + this.prevBurst * 0.5);
+      this.prevBurst = this.burst;
       onFix({ speed: this.speed, accuracy: 5, t: nowS() });
     };
     tick();
